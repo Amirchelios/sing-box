@@ -138,7 +138,17 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 		return s.group.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	s.group.history.DeleteURLTestHistory(outbound.Tag())
+	s.group.history.DeleteURLTestHistory(RealTag(outbound))
+	if fallback := s.group.SelectFallback(network, RealTag(outbound)); fallback != nil {
+		conn, retryErr := fallback.DialContext(ctx, network, destination)
+		if retryErr == nil {
+			s.logger.DebugContext(ctx, "fallback outbound ", fallback.Tag(), " recovered failed urltest outbound ", outbound.Tag())
+			return s.group.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
+		}
+		s.logger.ErrorContext(ctx, retryErr)
+		s.group.history.DeleteURLTestHistory(RealTag(fallback))
+		return nil, retryErr
+	}
 	return nil, err
 }
 
@@ -156,7 +166,17 @@ func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (ne
 		return s.group.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	s.group.history.DeleteURLTestHistory(outbound.Tag())
+	s.group.history.DeleteURLTestHistory(RealTag(outbound))
+	if fallback := s.group.SelectFallback(N.NetworkUDP, RealTag(outbound)); fallback != nil {
+		conn, retryErr := fallback.ListenPacket(ctx, destination)
+		if retryErr == nil {
+			s.logger.DebugContext(ctx, "fallback outbound ", fallback.Tag(), " recovered failed urltest outbound ", outbound.Tag())
+			return s.group.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
+		}
+		s.logger.ErrorContext(ctx, retryErr)
+		s.group.history.DeleteURLTestHistory(RealTag(fallback))
+		return nil, retryErr
+	}
 	return nil, err
 }
 
@@ -310,6 +330,33 @@ func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
 		return nil, false
 	}
 	return minOutbound, true
+}
+
+func (g *URLTestGroup) SelectFallback(network string, failedTag string) adapter.Outbound {
+	var minDelay uint16
+	var minOutbound adapter.Outbound
+	for _, detour := range g.outbounds {
+		if RealTag(detour) == failedTag || !common.Contains(detour.Network(), network) {
+			continue
+		}
+		history := g.history.LoadURLTestHistory(RealTag(detour))
+		if history == nil {
+			continue
+		}
+		if minDelay == 0 || minDelay > history.Delay+g.tolerance {
+			minDelay = history.Delay
+			minOutbound = detour
+		}
+	}
+	if minOutbound != nil {
+		return minOutbound
+	}
+	for _, detour := range g.outbounds {
+		if RealTag(detour) != failedTag && common.Contains(detour.Network(), network) {
+			return detour
+		}
+	}
+	return nil
 }
 
 func (g *URLTestGroup) loopCheck() {
